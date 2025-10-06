@@ -1,0 +1,42 @@
+# req.txt
+
+# --- Core Machine Learning Libraries ---
+#torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+torch
+pandas
+numpy
+scikit-learn
+plotly
+playwright
+PyYaml
+
+# --- Hugging Face Ecosystem for Fine-Tuning ---
+transformers
+peft
+bitsandbytes
+accelerate
+datasets
+sentencepiece
+
+# --- Data Acquisition & Handling ---
+yfinance
+requests
+beautifulsoup4
+newsapi-python
+
+# --- Web Backend & Frontend ---
+fastapi
+uvicorn[standard]
+streamlit
+
+# --- Visualization & Utilities ---
+matplotlib
+seaborn
+python-dotenv
+tqdm
+
+# --- For Running Notebooks ---
+jupyter
+notebook
+jupyterlab
+ipykernel

@@ -1,0 +1,215 @@
+# === INSTANCE 1: TIME SERIES FORECASTING ===
+        logger.info("--- Loading and Running Instance 1: Time Series Model ---")
+        bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
+        model = AutoModelForCausalLM.from_pretrained(BASE_MODEL_ID, quantization_config=bnb_config, device_map="auto",torch_dtype=torch.bfloat16)
+        tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, use_fast=True)
+        ts_adapter_path = PROJECT_ROOT / "models" / "processed" / f"{BASE_MODEL_ID.replace('/', '_')}-timeseries-generalist-v1" / "final_model"
+        model = PeftModel.from_pretrained(model, str(ts_adapter_path), adapter_name="timeseries")
+        context_days_to_fetch = TIME_WINDOW_LOGIC[-1]['context_range_days'] 
+        for window in sorted(TIME_WINDOW_LOGIC, key=lambda x: x['pred_days']):
+            if prediction_days <= window['pred_days']:
+                context_days_to_fetch = window['context_range_days']
+                break
+
+        if context_days_to_fetch <= 30: period = "1mo"
+        elif context_days_to_fetch <= 60: period = "2mo"
+        elif context_days_to_fetch <= 90: period = "3mo"
+        elif context_days_to_fetch <= 180: period = "6mo"
+        elif context_days_to_fetch <= 365: period = "1y"
+        elif context_days_to_fetch <= 1000: period = "3y"
+        else: period = "5y"
+
+        logger.info(f"Prediction horizon: {prediction_days} days. Fetching {period} of context data.")
+        
+        df_stock = get_stock_data(yfinance_link=yfinance_link, period=period, save_path=None)
+        if df_stock.empty:
+            results["error_message"] = f"Could not fetch historical data for {ticker_symbol}."
+            return results
+            
+        context_days, context_prices = len(df_stock), df_stock['Close'].tolist()
+        context_str = ", ".join([f"{p:.2f}" for p in context_prices])
+        mean, std_dev = df_stock['Close'].mean(), df_stock['Close'].std()
+        trend = "upward" if context_prices[-1] > context_prices[0] else "downward"
+        
+        ts_prompt = f"""<|begin_of_text|><|start_header_id|>user<|end_header_id|>
+You are a financial analyst specializing in time series forecasting.
+Now, perform the following task.
+TASK: Time Series Forecast.
+STOCK: {ticker_symbol}
+STATISTICS: mean={mean:.2f}, std_dev={std_dev:.2f}, trend={trend}
+CONTEXT_DAYS: {context_days}
+DATA: [{context_str}]
+Predict the next {prediction_days} closing prices.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+PREDICTION:"""
+        
+        model.set_adapter("timeseries")
+        inputs = tokenizer(ts_prompt, return_tensors="pt").to(model.device)
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=100,
+            pad_token_id=tokenizer.eos_token_id,
+            do_sample=True,
+            temperature=0.6,
+            top_p=0.9
+            )
+        forecast_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        price_forecast = [float(p.strip()) for p in re.findall(r'[\d\.]+', forecast_text.split("PREDICTION:")[1])]
+        results["forecast_prices"] = price_forecast
+
+        logger.info("--- Releasing Time Series model ---")
+        del model, tokenizer, inputs, outputs
+        torch.cuda.empty_cache()
+        model, tokenizer = None, None
+
+
+
+
+
+
+
+
+# === INSTANCE 1: TIME SERIES FORECASTING (with Recursive Summarization) ===
+        logger.info("--- Loading and Running Instance 1: Time Series Model ---")
+        bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
+        model = AutoModelForCausalLM.from_pretrained(BASE_MODEL_ID, quantization_config=bnb_config, device_map="auto")
+        tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, use_fast=True)
+        tokenizer.pad_token = tokenizer.eos_token
+        ts_adapter_path = PROJECT_ROOT / "models" / "processed" / f"{BASE_MODEL_ID.replace('/', '_')}-timeseries-generalist-v1" / "final_model"
+        model = PeftModel.from_pretrained(model, str(ts_adapter_path))
+
+        # === Step 1: Determine the optimal request horizon ("Predict Long, Use Short") ===
+        model_request_days = prediction_days
+        for window in sorted(TIME_WINDOW_LOGIC, key=lambda x: x['pred_days']):
+            if prediction_days <= window['pred_days']:
+                model_request_days = window['pred_days']
+                break
+        logger.info(f"User requested {prediction_days} days. Rounding up to request {model_request_days} days from the model.")
+
+        # === Step 2: Determine the correct context for THAT request ("Dynamic Context Alignment") ===
+        context_days_to_use = 500 # Default for safety if something goes wrong
+        for window in TIME_WINDOW_LOGIC:
+            if window['pred_days'] == model_request_days:
+                context_days_to_use = window['context_range_days']
+                break
+        logger.info(f"For a {model_request_days}-day model request, using {context_days_to_use} days of context.")  
+        # Fetch a long history required for the summarization context
+        df_stock = get_stock_data(yfinance_link=yfinance_link, period="5y", save_path=None)
+        
+        if df_stock.empty or len(df_stock) < context_days_to_use:
+            results["error_message"] = f"Not enough historical data for {ticker_symbol} (need at least {context_days_to_use} days)."
+            return results
+
+        # Isolate the context data for summarization
+        context_df = df_stock.tail(context_days_to_use)
+
+        # --- Recursive Context Compression Loop ---
+        logger.info("Building historical context via recursive summarization...")
+        rolling_summary = "No significant trend observed yet."
+        data_chunks = create_overlapping_chunks(context_df, chunk_size=180, overlap=30)
+
+        for i, chunk in enumerate(data_chunks):
+            logger.info(f"Processing context chunk {i+1}/{len(data_chunks)}...")
+            chunk_data_str = ", ".join([f"{p:.2f}" for p in chunk['Close'].tolist()])
+            prompt = create_summarizer_prompt(rolling_summary, chunk_data_str)
+            
+            inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=512).to(model.device)
+            outputs = model.generate(
+                **inputs, max_new_tokens=150, pad_token_id=tokenizer.eos_token_id,
+                do_sample=True, temperature=0.5, top_p=0.9
+            )
+            
+            input_token_len = inputs.input_ids.shape[1]
+            generated_token_ids = outputs[0, input_token_len:]
+            assistant_response = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+
+            match = re.search(r"UPDATED_SUMMARY:(.*?)PREDICTION:", assistant_response, re.DOTALL | re.IGNORECASE)
+            if match:
+                rolling_summary = match.group(1).strip()
+            else:
+                logger.warning(f"Could not parse summary from chunk {i+1} output.")
+        
+        # --- FALLBACK LOGIC ---
+        # If the summarization loop failed, fall back to a simpler context
+        if rolling_summary == "No significant trend observed yet.":
+            logger.warning("Recursive summarization failed. Falling back to simple context method.")
+            # Use a simple prompt with the most recent data that fits
+            simple_context_df = context_df.tail(180) 
+            final_context_str = ", ".join([f"{p:.2f}" for p in simple_context_df['Close'].tolist()])
+            mean = simple_context_df['Close'].mean()
+            std_dev = simple_context_df['Close'].std()
+            trend = "upward" if simple_context_df['Close'].iloc[-1] > simple_context_df['Close'].iloc[0] else "downward"
+            
+            # Overwrite the final_prompt with the original, simple version
+            final_prompt = f"""<|begin_of_text|><|start_header_id|>user<|end_header_id|>
+            You are a financial analyst specializing in time series forecasting. Now, perform the following task.
+            TASK: Time Series Forecast.
+            STOCK: {ticker_symbol}
+            STATISTICS: mean={mean:.2f}, std_dev={std_dev:.2f}, trend={trend}
+            CONTEXT_DAYS: {len(simple_context_df)}
+            DATA: [{final_context_str}]
+            Predict the next {model_request_days} closing prices.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+            PREDICTION:"""
+            # We will skip the 'enriched context' step since the fallback is active
+            # Set rolling_summary to an informative message for the logs
+            rolling_summary = "[Fallback Activated] Using simple 180-day context."
+        
+        
+        logger.info(f"Final Historical Summary: {rolling_summary}")
+
+        # --- Final Prediction with Enriched Context ---
+        logger.info("Making final forecast with enriched context...")
+        final_context_df = context_df.tail(180) # Use most recent data for the final prompt
+        final_context_str = ", ".join([f"{p:.2f}" for p in final_context_df['Close'].tolist()])
+        
+        mean = final_context_df['Close'].mean()
+        std_dev = final_context_df['Close'].std()
+        trend = "upward" if final_context_df['Close'].iloc[-1] > final_context_df['Close'].iloc[0] else "downward"
+
+        final_prompt = f"""<|begin_of_text|><|start_header_id|>user<|end_header_id|>
+        You are a financial analyst specializing in time series forecasting.
+        Based on your comprehensive analysis summarized as: "{rolling_summary}", perform the following task.
+
+        TASK: Time Series Forecast.
+        STOCK: {ticker_symbol}
+        STATISTICS: mean={mean:.2f}, std_dev={std_dev:.2f}, trend={trend}
+        CONTEXT_DAYS: {len(final_context_df)}
+        DATA: [{final_context_str}]
+        Predict the next {model_request_days} closing prices.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+        PREDICTION:"""
+
+        inputs = tokenizer(final_prompt, return_tensors="pt", truncation=True, max_length=512).to(model.device)
+        outputs = model.generate(
+            **inputs, max_new_tokens=prediction_days * 5, pad_token_id=tokenizer.eos_token_id,
+            do_sample=True, temperature=0.4, top_p=0.9
+        )
+        
+        input_token_len = inputs.input_ids.shape[1]
+        generated_token_ids = outputs[0, input_token_len:]
+        final_assistant_response = tokenizer.decode(generated_token_ids, skip_special_tokens=True)
+        
+        price_strings = re.findall(r'(\d+\.?\d*)', final_assistant_response)
+        price_forecast = [float(p) for p in price_strings if p and p != '.']
+        price_forecast = price_forecast[:prediction_days]
+        
+        for i in range(1, len(price_forecast)):
+            # Check for a >50% drop or a >100% jump in a single day
+            if price_forecast[i] < price_forecast[i-1] * 0.5 or price_forecast[i] > price_forecast[i-1] * 2.0:
+                logger.warning(f"Statistically unlikely jump detected in forecast: {price_forecast}. Flagging as potentially unreliable.")
+                # You could add a flag to the results dict here
+                results["is_unreliable"] = True
+                break
+
+        if not price_forecast:
+            raise ValueError("Model failed to generate a parsable forecast.")
+
+        results["forecast_prices"] = price_forecast
+        # Pass the historical data used in the forecast to the results
+        results["historical_data_for_forecast"] = df_stock.to_dict('records')
+        results["last_actual_price"] = df_stock['Close'].iloc[-1]
+        results["forecast_prices"] = price_forecast
+
+
+        logger.info("--- Releasing Time Series model ---")
+        del model, tokenizer, inputs, outputs
+        torch.cuda.empty_cache()
+        model, tokenizer = None, None

@@ -1,0 +1,159 @@
+# src/pipeline/eval.py
+
+import torch
+from pathlib import Path
+import pandas as pd
+import re
+from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+from peft import PeftModel
+import logging
+import sys
+import numpy as np
+
+# --- Setup ---
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+sys.path.append(str(PROJECT_ROOT))
+from src.data_ingestion.scraper import get_stock_data
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# --- Configuration ---
+BASE_MODEL_ID = "FreedomIntelligence/TinyDeepSeek-0.5B-base"
+ADAPTER_PATH = PROJECT_ROOT / "models" / "processed" / f"{BASE_MODEL_ID.replace('/', '_')}-timeseries-generalist-v1" / "final_model"
+
+def run_evaluation(yfinance_link: str, prediction_days: int) -> dict:
+    """
+    Backtests the time-series model on historical data.
+    """
+    logger.info("--- Starting Model Evaluation Pipeline ---")
+    model, tokenizer = None, None
+    results = {"status": "Failure"}
+
+    try:
+        # --- 1. Load the Fine-Tuned Model ---
+        logger.info("Loading fine-tuned time-series model...")
+        bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
+        model = AutoModelForCausalLM.from_pretrained(BASE_MODEL_ID, quantization_config=bnb_config, device_map="auto")
+        tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_ID, use_fast=True)
+        model = PeftModel.from_pretrained(model, str(ADAPTER_PATH))
+        
+        # --- 2. Fetch Data and Create Holdout Set ---
+        ticker_symbol = yfinance_link.split("/")[-1].strip()
+        # Fetch a long period to ensure we have enough data for context + holdout
+        df_full = get_stock_data(yfinance_link=yfinance_link, period="2y", save_path=None)
+
+        if len(df_full) < prediction_days + 60: # Need at least 60 days of context
+            raise ValueError("Not enough historical data to perform a valid backtest.")
+
+        # Split the data: the last N days are the "truth", the rest is context
+        holdout_df = df_full.tail(prediction_days)
+        context_df = df_full.iloc[:-prediction_days]
+        actual_prices = holdout_df['Close'].tolist()
+
+        # --- 3. Generate Forecast Based on Context (with One-Shot Example) ---
+        logger.info(f"Generating a {prediction_days}-day forecast for {ticker_symbol}...")
+
+        # Create an example from the historical data
+        example_context_end = len(context_df) - prediction_days
+        example_pred_end = len(context_df)
+        if example_context_end < 60: # Ensure example has some context
+            raise ValueError("Not enough data to create a one-shot example.")
+
+        example_context_df = context_df.iloc[example_context_end - 60 : example_context_end]
+        example_prediction_df = context_df.iloc[example_context_end : example_pred_end]
+
+        example_context_prices = ", ".join([f"{p:.2f}" for p in example_context_df['Close'].tolist()])
+        example_prediction_prices = ", ".join([f"{p:.2f}" for p in example_prediction_df['Close'].tolist()])
+
+        # Create the final prompt using the most recent data
+        context_days, context_prices = len(context_df), context_df['Close'].tolist()
+        context_str = ", ".join([f"{p:.2f}" for p in context_prices])
+        mean, std_dev = context_df['Close'].mean(), context_df['Close'].std()
+        trend = "upward" if context_prices[-1] > context_prices[0] else "downward"
+
+        # This new prompt includes a complete, realistic example
+        ts_prompt = f"""<|begin_of_text|><|start_header_id|>user<|end_header_id|>
+        You are a financial analyst specializing in time series forecasting.
+
+        Below is an example of a forecast.
+        ---
+        EXAMPLE:
+        TASK: Time Series Forecast.
+        STOCK: {ticker_symbol}
+        CONTEXT_DAYS: 60
+        DATA: [{example_context_prices}]
+        Predict the next {prediction_days} closing prices.
+
+        PREDICTION: [{example_prediction_prices}]
+        ---
+
+        Now, perform the following task.
+
+        TASK: Time Series Forecast.
+        STOCK: {ticker_symbol}
+        STATISTICS: mean={mean:.2f}, std_dev={std_dev:.2f}, trend={trend}
+        CONTEXT_DAYS: {context_days}
+        DATA: [{context_str}]
+        Predict the next {prediction_days} closing prices.<|eot_id|><|start_header_id|>assistant<|end_header_id|>
+        PREDICTION:"""
+        
+        inputs = tokenizer(ts_prompt, return_tensors="pt").to(model.device)
+        outputs = model.generate(
+            **inputs, max_new_tokens=100, pad_token_id=tokenizer.eos_token_id,
+            do_sample=True, temperature=0.6, top_p=0.9
+        )
+        forecast_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        price_strings = re.findall(r'(\d+\.?\d*)', forecast_text.split("PREDICTION:")[1])
+        all_predicted_prices = [float(p) for p in price_strings if p and p != '.']
+        predicted_prices = all_predicted_prices[:prediction_days]
+
+        if len(predicted_prices) < prediction_days:
+            logger.warning(f"Length mismatch: Model only predicted {len(predicted_prices)} days but {prediction_days} were expected. Evaluating on the available predictions.")
+            actual_prices = actual_prices[:len(predicted_prices)]
+
+        # --- 4. Calculate Error Metrics ---
+        logger.info("Comparing forecast to actual prices and calculating error metrics...")
+        errors = np.array(predicted_prices) - np.array(actual_prices)
+        mae = np.mean(np.abs(errors))
+        mape = np.mean(np.abs(errors) / np.array(actual_prices)) * 100
+
+        results.update({
+            "status": "Success",
+            "mae": mae,
+            "mape": mape,
+            "actual_prices": actual_prices,
+            "predicted_prices": predicted_prices
+        })
+        
+    except Exception as e:
+        logger.error(f"An error occurred during evaluation: {e}", exc_info=True)
+        results["error_message"] = str(e)
+    finally:
+        if 'model' in locals() and model is not None:
+            del model
+        if 'tokenizer' in locals() and tokenizer is not None:
+            del tokenizer
+        torch.cuda.empty_cache()
+        
+    return results
+
+if __name__ == '__main__':
+    test_link = "https://finance.yahoo.com/quote/ONDS/"
+    test_days = 10
+    
+    eval_results = run_evaluation(yfinance_link=test_link, prediction_days=test_days)
+
+    if eval_results["status"] == "Success":
+        print("\n--- EVALUATION COMPLETED SUCCESSFULLY ---")
+        print(f"Stock: {test_link.split('/')[-1]}")
+        print(f"Prediction Horizon: {test_days} days")
+        print("\n--- ERROR METRICS ---")
+        print(f"Mean Absolute Error (MAE): ${eval_results['mae']:.2f}")
+        print(f"Mean Absolute Percentage Error (MAPE): {eval_results['mape']:.2f}%")
+        print("\n--- COMPARISON ---")
+        print(f"Actual Prices:    {[f'${p:.2f}' for p in eval_results['actual_prices']]}")
+        print(f"Predicted Prices: {[f'${p:.2f}' for p in eval_results['predicted_prices']]}")
+    else:
+        print(f"\n--- EVALUATION FAILED ---")
+        print(f"Error: {eval_results['error_message']}")

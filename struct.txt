@@ -1,0 +1,31 @@
+./
+|___data/
+|___logs/
+|___models/
+|___notebooks/
+    |___01_data_exploration.ipynb
+    |___02_finetune_timeseries_model.ipynb
+    |___03_finetune_sentiment_model.ipynb
+|___src/
+    |___app/
+       |___backend.py
+       |___frontend.py
+    |___data_ingestion/
+        |___adjustdataset.py
+        |___helper.py
+        |___scraper.py
+    |___model_training/
+        |___datacftimeser.py
+        |___dataftsentiment.py
+        |___sentimentft.py
+        |___tempsentdata.py
+        |___timeseriesft.py
+        |___weblinks.json
+    |___pipeline/
+        |___eval.py
+        |___main.py
+|___.env
+|___.gitignore
+|___logconfig.yaml
+|___readme.md
+|___requirements.txt

@@ -1,11 +1,9 @@
-# src/pipeline/main.py
-import gc
+#src/pipeline/eval.py
 import torch
 from pathlib import Path
 import pandas as pd
 import re
 from datetime import datetime, timedelta
-from newsapi import NewsApiClient
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig, pipeline
 from peft import PeftModel
 import logging
@@ -15,14 +13,15 @@ import os
 import yfinance as yf
 from typing import List
 import time
+import numpy as np
+from newsapi import NewsApiClient
+import gc
 
 load_dotenv()
-# --- Setup ---
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.append(str(PROJECT_ROOT))
 from src.data_ingestion.scraper import get_stock_data
 
-# (Setup basic logging if the main app doesn't)
 logging.basicConfig(level=logging.INFO, format='%(asctime)s.%(msecs)03dZ - %(levelname)s - %(message)s', datefmt='%Y-%m-%dT%H:%M:%S')
 logging.Formatter.converter = time.gmtime
 logger = logging.getLogger(__name__)
@@ -41,8 +40,8 @@ TIME_WINDOW_LOGIC = [
     {"pred_days": 90, "context_range_days": 1000},
 ]
 
+# --- Helper Functions (Copied from main.py) ---
 def create_overlapping_chunks(df: pd.DataFrame, chunk_size: int, overlap: int) -> List[pd.DataFrame]:
-    """Splits a DataFrame into overlapping chunks."""
     chunks = []
     start = 0
     while start < len(df):
@@ -68,24 +67,20 @@ def create_summarizer_prompt(prior_summary: str, chunk_data_str: str) -> str:
     UPDATED_SUMMARY:<|eot_id|><|start_header_id|>assistant<|end_header_id|>
     """
 
-def run_analysis_pipeline(yfinance_link: str, prediction_days: int) -> dict:
+# --- Main Test Pipeline Function ---
+
+def run_test_pipeline(yfinance_link: str, prediction_days: int) -> dict:
     """
-    Runs the full 3-instance pipeline with a merged sentiment approach,
-    loading and releasing models sequentially to manage memory.
+    Runs the full pipeline in backtesting mode, generating a forecast,
+    an "as-if" report, accuracy metrics, and a final performance review.
     """
     results = {"status": "Failure", "error_message": None}
-    # Initialize all model variables to None for robust cleanup in the 'finally' block
     model, tokenizer, sentiment_pipeline, reporting_model, reporting_tokenizer = None, None, None, None, None
     
-    if not (1 <= prediction_days <= 90):
-        results["error_message"] = "Prediction days must be between 1 and 90."
-        return results
-
     try:
+        # === SETUP: DATA FETCHING AND SPLITTING ===
         ticker_symbol = yfinance_link.split("/")[-1].strip()
         if not ticker_symbol: ticker_symbol = yfinance_link.split("/")[-2].strip()
-
-        # === Step 1: Determine Optimal Horizons & Fetch Data ===
         model_request_days = prediction_days
         for window in sorted(TIME_WINDOW_LOGIC, key=lambda x: x['pred_days']):
             if prediction_days <= window['pred_days']:
@@ -97,24 +92,26 @@ def run_analysis_pipeline(yfinance_link: str, prediction_days: int) -> dict:
             if window['pred_days'] == model_request_days:
                 context_days_to_use = window['context_range_days']
                 break
-        logger.info(f"User requested {prediction_days} days. Model will predict {model_request_days} days using {context_days_to_use} days of context.")
-
-        # Fetch all historical data needed for the entire pipeline
-        df_stock = get_stock_data(yfinance_link=yfinance_link, period="5y", save_path=None)
-        if df_stock.empty or len(df_stock) < context_days_to_use:
-            results["error_message"] = f"Not enough historical data for {ticker_symbol} (need at least {context_days_to_use} days)."
-            return results
         
-        # Save the last actual price for the final report
-        results["last_actual_price"] = df_stock['Close'].iloc[-1]
-        context_df = df_stock.tail(context_days_to_use)
-        rolling_summary = "No significant trend observed yet."
-        # === INSTANCE 1a: CONTEXT SUMMARIZATION (with Llama-3.2) ===
+        logger.info(f"TEST MODE: Predicting {prediction_days} days. Model will use {context_days_to_use} days of context to predict {model_request_days} days.")
+        
+        df_full = get_stock_data(yfinance_link=yfinance_link, period="5y", save_path=None)
+        if df_full.empty or len(df_full) < context_days_to_use + prediction_days:
+            raise ValueError(f"Not enough historical data to perform backtest (need {context_days_to_use + prediction_days} days).")
+
+        holdout_df = df_full.tail(prediction_days)
+        context_df = df_full.iloc[:-(prediction_days)]
+        actual_prices = holdout_df['Close'].tolist()
+        last_price_in_context = context_df['Close'].iloc[-1]
+
+        # === STEP 1: RUN INSTANCE 1 (FORECAST) ===
+       # === INSTANCE 1a: CONTEXT SUMMARIZATION (with Llama-3.2) ===
         logger.info("--- Loading and Running Instance 1a: Context Summarization (Llama) ---")
         bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
         # Load the powerful REPORTING model for the summarization task
         reporting_model = AutoModelForCausalLM.from_pretrained(REPORTING_MODEL_ID, quantization_config=bnb_config, device_map="auto")
         reporting_tokenizer = AutoTokenizer.from_pretrained(REPORTING_MODEL_ID)
+        rolling_summary = "No significant trend observed yet."
         
         data_chunks = create_overlapping_chunks(context_df, chunk_size=180, overlap=30)
         for i, chunk in enumerate(data_chunks):
@@ -130,6 +127,7 @@ def run_analysis_pipeline(yfinance_link: str, prediction_days: int) -> dict:
             
             if new_summary: # As long as the model says something, update the summary
                 rolling_summary = new_summary
+
         comma_index = rolling_summary.find(',')
         if comma_index != -1:
             rolling_summary = rolling_summary[comma_index + 1:].strip()
@@ -150,27 +148,20 @@ def run_analysis_pipeline(yfinance_link: str, prediction_days: int) -> dict:
         final_context_df = context_df.tail(180)
         final_context_str = ", ".join([f"{p:.2f}" for p in final_context_df['Close'].tolist()])
         mean, std_dev = final_context_df['Close'].mean(), final_context_df['Close'].std()
-        # 1. Define your stability threshold (e.g., 5% change)
         stability_threshold = 5.0 
-
-        # 2. Get the first and last prices from the context dataframe
         first_price = final_context_df['Close'].iloc[0]
-        last_price = final_context_df['Close'].iloc[-1]
-
-        # 3. Calculate the percentage change
+        last_price_from_context = final_context_df['Close'].iloc[-1] # Use a different name to avoid conflict
         if first_price > 0:
-            percent_change = ((last_price - first_price) / first_price) * 100
+            percent_change = ((last_price_from_context - first_price) / first_price) * 100
         else:
-            percent_change = 0 # Avoid division by zero if the first price is 0
-
-        # 4. Assign the trend label based on the threshold
+            percent_change = 0
         if abs(percent_change) < stability_threshold:
             trend = "stable"
-        elif last_price > first_price:
+        elif last_price_from_context > first_price:
             trend = "upward"
         else:
             trend = "downward"
-        last_price = results.get("last_actual_price")
+        last_price = last_price_in_context 
         final_prompt = f"""<|begin_of_text|><|start_header_id|>user<|end_header_id|>
         You are a financial analyst... Based on your comprehensive analysis summarized as: "{rolling_summary}", perform the following task.
 
@@ -202,13 +193,42 @@ def run_analysis_pipeline(yfinance_link: str, prediction_days: int) -> dict:
                 break
         
         results["forecast_prices"] = price_forecast
-        results["historical_data"] = df_stock.to_dict('records')
+        results["historical_data"] = df_full.to_dict('records')
 
         logger.info("--- Releasing Time Series model ---")
         del model, tokenizer, inputs, outputs
         torch.cuda.empty_cache()
         model, tokenizer = None, None
+        
+        # === STEP 2: EVALUATE INSTANCE 1 (METRICS) ===
+        logger.info("--- [STEP 2] Evaluating forecast accuracy ---")
 
+        # Ensure arrays are numpy arrays for calculations
+        forecast_np = np.array(price_forecast)
+        actual_np = np.array(actual_prices)
+
+        # Basic Error Metrics
+        errors = forecast_np - actual_np
+        results['mae'] = np.mean(np.abs(errors))
+        results['mape'] = np.mean(np.abs(errors) / actual_np) * 100
+        results['mse'] = np.mean(errors**2)
+        results['rmse'] = np.sqrt(results['mse'])
+
+        # Directional Accuracy (crucial for finance)
+        actual_diff = np.diff(actual_np)
+        forecast_diff = np.diff(forecast_np)
+        # Check if the sign of the change is the same
+        correct_direction = (np.sign(actual_diff) == np.sign(forecast_diff)).sum()
+        results['directional_accuracy'] = (correct_direction / len(actual_diff)) * 100 if len(actual_diff) > 0 else 0
+
+        logger.info(f"""Forecast Accuracy --> 
+            MAE: ${results['mae']:.2f}
+            MAPE: {results['mape']:.2f}%
+            RMSE: ${results['rmse']:.2f}
+            Directional Accuracy: {results['directional_accuracy']:.2f}%
+        """)
+
+        # === STEP 3 & 4: RUN INSTANCE 2 (SENTIMENT) ===
         # === INSTANCE 2 (Part A): FinBERT Labeling ===
         logger.info("--- Loading and Running Instance 2a: FinBERT Labeling ---")
         sentiment_pipeline = pipeline("sentiment-analysis", model="ProsusAI/finbert", device=0)
@@ -219,7 +239,8 @@ def run_analysis_pipeline(yfinance_link: str, prediction_days: int) -> dict:
         company_name = yf_ticker.info.get('longName', ticker_symbol)
         search_query = f'"{company_name}" OR {ticker_symbol}'
         logger.info(f"Searching for news with query: {search_query}")
-        from_date = (datetime.now() - timedelta(days=5)).strftime('%Y-%m-%d')
+        last_context_date = pd.to_datetime(context_df['Date'].iloc[-1])
+        from_date = (last_context_date - timedelta(days=5)).strftime('%Y-%m-%d')
         
         try:
             articles = newsapi.get_everything(q=search_query, from_param=from_date, language='en', sort_by='relevancy', page_size=20)['articles']
@@ -233,11 +254,12 @@ def run_analysis_pipeline(yfinance_link: str, prediction_days: int) -> dict:
                 if article.get('title'): all_headlines.add(article['title'])
         except Exception as e:
             logger.error(f"Could not fetch news from yfinance: {e}", exc_info=True)
-
+        r=0
         labeled_headlines = []
         if all_headlines:
             with torch.no_grad():
                 analyses = sentiment_pipeline(list(all_headlines))
+                r=69
             for headline, analysis in zip(all_headlines, analyses):
                 labeled_headlines.append(f"'{headline}' (Sentiment: {analysis['label'].capitalize()}, Score: {analysis['score']:.2f})")
         
@@ -246,7 +268,9 @@ def run_analysis_pipeline(yfinance_link: str, prediction_days: int) -> dict:
         if hasattr(sentiment_pipeline, 'model'):
             del sentiment_pipeline.model
         # Now delete the rest
-        del sentiment_pipeline, analyses
+        del sentiment_pipeline
+        if r==69:
+            del analyses
         torch.cuda.empty_cache()
         sentiment_pipeline = None
         
@@ -272,18 +296,14 @@ def run_analysis_pipeline(yfinance_link: str, prediction_days: int) -> dict:
                 outputs = reporting_model.generate(**inputs, max_new_tokens=100, pad_token_id=reporting_tokenizer.eos_token_id)
             sentiment_summary = reporting_tokenizer.decode(outputs[0, len(inputs.input_ids[0]):], skip_special_tokens=True).strip()
 
-        # Instance 3: Create the final report
-        last_price = results.get("last_actual_price")
-        unreliable_warning = ""
-        if results.get("is_unreliable"):
-            unreliable_warning = "\n\n**IMPORTANT:** The quantitative model's forecast was flagged as potentially unreliable due to statistically unlikely price jumps. Address this uncertainty in your analysis."
-
-        reporting_prompt = f"""<|begin_of_text|><|start_header_id|>user<|end_header_id|>
+        # === STEP 5: GENERATE "AS-IF" ANALYST REPORT ===
+        logger.info("--- [STEP 5] Generating 'as-if' analyst report ---")
+        original_report_prompt = f"""<|begin_of_text|><|start_header_id|>user<|end_header_id|>
         You are a senior financial analyst. Your task is to write a professional investor report for the stock **{ticker_symbol}**.
-        Critically analyze the data provided.{unreliable_warning}
+        Critically analyze the data provided.
 
         **CONTEXT:**
-        - The most recent closing price for {ticker_symbol} is **${last_price:.2f}**.
+        - The most recent closing price for {ticker_symbol} is **${last_price_in_context:.2f}**.
 
         **DATA TO SYNTHESIZE:**
         1.  **Quantitative Model Forecast:** The price forecast for the next {prediction_days} days is {price_forecast}.
@@ -295,21 +315,46 @@ def run_analysis_pipeline(yfinance_link: str, prediction_days: int) -> dict:
         - Do not use generic placeholders.
 
         ANALYST REPORT:<|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
-
-        inputs = reporting_tokenizer(reporting_prompt, return_tensors="pt").to(reporting_model.device)
+        
+        inputs = reporting_tokenizer(original_report_prompt, return_tensors="pt").to(reporting_model.device)
         with torch.no_grad():
             outputs = reporting_model.generate(**inputs, max_new_tokens=512, pad_token_id=reporting_tokenizer.eos_token_id)
-        final_report_text = reporting_tokenizer.decode(outputs[0, len(inputs.input_ids[0]):], skip_special_tokens=True)
-        
-        results["analyst_report"] = final_report_text.strip()
-        last_date = pd.to_datetime(df_stock['Date'].iloc[-1])
-        results["forecast_dates"] = [(last_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(1, len(price_forecast) + 1)]
-        results["status"] = "Success"
+        original_analyst_report = reporting_tokenizer.decode(outputs[0, len(inputs.input_ids[0]):], skip_special_tokens=True)
+        results['original_analyst_report'] = original_analyst_report.strip()
+
+        # === STEP 6: GENERATE FINAL TEST PERFORMANCE REVIEW ===
+        logger.info("--- [STEP 6] Generating final test performance review ---")
+        test_report_prompt = f"""<|begin_of_text|><|start_header_id|>user<|end_header_id|>
+        You are a lead data scientist reviewing the performance of a multi-agent AI forecasting pipeline. Your task is to write a **Test Performance Review**.
+        You have the following information:
+        - **Stock:** {ticker_symbol}
+        - **Original AI Analyst Report:** "{original_analyst_report}"
+        - **AI's Price Forecast:** {price_forecast}
+        - **Actual Outcome (Ground Truth):** {actual_prices}
+        - **Forecast Error Metrics:**   - Mean Absolute Error (MAE): ${results['mae']:.2f} (Average dollar error)
+        - Root Mean Squared Error (RMSE): ${results['rmse']:.2f} (Penalizes large errors more)
+        - Mean Absolute Percentage Error (MAPE): {results['mape']:.2f}%
+        - Directional Accuracy: {results['directional_accuracy']:.2f}% (Correctly predicted up/down trend)
+        - **News Sentiment Summary Used:** "{sentiment_summary}"
+
+        **Instructions for your review:**
+        1. Start with a clear verdict: Did the pipeline perform well, poorly, or moderately?
+        2. Critique the AI's price forecast. How did it compare to the actual outcome? Did it predict the trend correctly?
+        3. Critique the original AI analyst report. Was its assessment (bullish/bearish/neutral) correct in hindsight? Did it correctly identify the risks?
+        4. Provide a concluding summary on the pipeline's overall performance for this specific test case.
+        TEST PERFORMANCE REVIEW:<|eot_id|><|start_header_id|>assistant<|end_header_id|>"""
+
+        inputs = reporting_tokenizer(test_report_prompt, return_tensors="pt").to(reporting_model.device)
+        with torch.no_grad():
+            outputs = reporting_model.generate(**inputs, max_new_tokens=512, pad_token_id=reporting_tokenizer.eos_token_id)
+        final_test_report = reporting_tokenizer.decode(outputs[0, len(inputs.input_ids[0]):], skip_special_tokens=True)
+        results['final_test_report'] = final_test_report.strip()
+
+        results['status'] = "Success"
 
     except Exception as e:
-        logger.error(f"An error occurred in the pipeline: {e}", exc_info=True)
+        logger.error(f"An error occurred during the test pipeline: {e}", exc_info=True)
         results["error_message"] = str(e)
-
     finally:
         logger.info("--- Releasing all models from memory ---")
         # Create a list of all variables that might hold GPU memory
@@ -324,27 +369,27 @@ def run_analysis_pipeline(yfinance_link: str, prediction_days: int) -> dict:
                 del locals()[var_name]
         torch.cuda.empty_cache()
         gc.collect()
-    
+        
     summary_full = torch.cuda.memory.memory_summary()
     print(summary_full) 
     return results
 
 if __name__ == '__main__':
-    # This block allows you to test the script directly
-    logger.info("--- Running Rudimentary Pipeline Test ---")
+    logger.info("--- Running Pipeline in Test Mode ---")
     
     test_link = "https://finance.yahoo.com/quote/AAPL"
-    test_days = 30
+    test_days = 30 
+    test_results = run_test_pipeline(yfinance_link=test_link, prediction_days=test_days)
     
-    pipeline_results = run_analysis_pipeline(yfinance_link=test_link, prediction_days=test_days)
-    
-    if pipeline_results["status"] == "Success":
-        print("\n--- PIPELINE COMPLETED SUCCESSFULLY ---")
-        print("\n--- FINAL ANALYST REPORT ---")
-        print(pipeline_results["analyst_report"])
-        print("\n--- FORECAST DATA ---")
-        print(f"Dates: {pipeline_results['forecast_dates']}")
-        print(f"Prices: {pipeline_results['forecast_prices']}")
+    if test_results["status"] == "Success":
+        print("\n" + "="*50)
+        print("--- TEST MODE COMPLETED SUCCESSFULLY ---")
+        print("="*50 + "\n")
+        print("--- ORIGINAL 'AS-IF' REPORT ---")
+        print(test_results['original_analyst_report'])
+        print("\n" + "="*50 + "\n")
+        print("--- FINAL TEST PERFORMANCE REVIEW ---")
+        print(test_results['final_test_report'])
+        print("\n" + "="*50 + "\n")
     else:
-        print(f"\n--- PIPELINE FAILED ---")
-        print(f"Error: {pipeline_results['error_message']}")
+        print(f"\n--- TEST MODE FAILED ---\nError: {test_results.get('error_message', 'Unknown error')}")

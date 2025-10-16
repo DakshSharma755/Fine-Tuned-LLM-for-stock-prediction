@@ -109,7 +109,8 @@ The final pipeline orchestrates the three specialized models in a sequential, me
 The final, generalized pipeline has been successfully tested on multiple tickers.
 
 * **Frontend Screenshot**
-![](frontendscreenshot.png)
+![](fendscshot_1.png)
+![](fendscshot_2.png)
 
 #### Example Output: 
 
@@ -140,5 +141,72 @@ The final, generalized pipeline has been successfully tested on multiple tickers
 >
 >In conclusion, while Plug's stock may experience a short-term price increase due to the neutral news sentiment and the EV market trend, the underlying risks and uncertainties associated with the company's exposure to the electric car market and the potential for negative headlines should not be overlooked. We recommend a thorough examination of the company's financials, management team, and competitive landscape before making any investment decisions.
 
-![Forecast Visualization](forecastvis.png)
-![](forecastviszoomedin.png)
+---
+
+## 4. Phase 3: Post-Deployment Iteration & Production Hardening
+
+Following the successful generalization of the pipeline, the project entered a new phase focused on improving forecast accuracy, building a robust evaluation framework, and hardening the application for continuous, stable operation in a server environment. This phase involved significant experimentation, deep debugging of GPU memory management, and key architectural changes to ensure reliability.
+
+### 4.1. Robust Backtesting & Evaluation (eval.py)
+
+To move beyond anecdotal testing and enable rigorous performance measurement, a dedicated backtesting script, eval.py, was created. This script mirrors the production main.py pipeline but adapts it for historical evaluation by:
+
+* **Data Splitting**: Automatically partitioning historical data into a "context" set (what the model knew at the time) and a "holdout" set (the ground truth outcome).
+
+* **"As-If" Reporting**: Generating the analyst report the AI would have created using only the past data.
+
+* **Comprehensive Metrics**: Calculating a suite of performance metrics to provide a multi-faceted view of the forecast's accuracy, including:
+
+    1.**MAE & RMSE:** To measure the average and large-error-penalized price deviation.
+
+    2.**MAPE:** To understand the error in percentage terms.
+
+    3.**Directional Accuracy:** A crucial financial metric to determine how often the model correctly predicted if the stock's price would increase or decrease.
+
+    4.**AI Performance Review:** In a final meta-step, the LLM is tasked with generating a "Test Performance Review," critiquing its own forecast and qualitative analysis in light of the ground truth data.
+
+This evaluation harness, exposed via a /test endpoint, became the cornerstone for all subsequent model and prompt engineering experiments.
+
+### 4.2. Experiment: Recursive Context Summarization (A Failed Approach)
+
+An initial hypothesis to improve forecast accuracy was that providing the model with a natural language summary of the long-term historical trend, in addition to the raw price data, would yield better results. A "rolling summary" feature was implemented where the Llama-3.2-3B model would recursively analyze overlapping chunks of historical data to build a narrative context (e.g., "The stock saw a period of high volatility before stabilizing and trending upwards").
+
+While sound in theory, this approach was ultimately abandoned. The generated summaries were often inconsistent or focused on noisy, short-term patterns. In some cases, the qualitative summary seemed to confuse the fine-tuned forecasting model, leading to statistically improbable price jumps and a decrease in overall accuracy. This highlighted a key learning: for a highly specialized, fine-tuned model, providing overly rich or potentially ambiguous qualitative context can be detrimental.
+
+### 4.3. Production Challenge: Solving the bitsandbytes Memory Leak
+
+The most significant technical challenge emerged when the application was deployed as a long-running FastAPI server. After the first successful API call, subsequent requests would fail with CUDA out of memory errors, even though the "load-and-release" pattern was in place. Debugging revealed that the bitsandbytes quantization library was not fully releasing VRAM, leading to a persistent memory leak that grew with each request. Several solutions were attempted in succession:
+
+*    **Attempt 1:** Standard Cleanup (torch.cuda.empty_cache()): The initial approach involved explicit variable deletion (del model) and calling PyTorch's cache-clearing function. This was ineffective, as bitsandbytes manages its own memory outside of PyTorch's standard cache.
+
+*    **Attempt 2:** Disabling Gradient Calculation (with torch.no_grad()): The next step was to wrap all inference calls in a torch.no_grad() context. This is a critical best practice that prevents PyTorch from building a computation graph, significantly reducing memory usage. While this mitigated the issue, a smaller, persistent leak remained, confirming that the problem was tied to the library's core memory allocation, not just the computation graph.
+
+*    **Attempt 3 (Success):** Process Isolation (worker.py): The final, successful solution was to architecturally isolate the entire ML pipeline. The FastAPI backend was refactored to no longer run the pipeline in-process. Instead, for each API request, it now spawns a separate, temporary worker process using Python's multiprocessing library. This worker process loads the models, runs the pipeline, and returns the result. When the process terminates, the operating system forcibly reclaims all memory associated with it, including the stubborn bitsandbytes cache. This approach completely solved the memory leak and resulted in a robust, stable server capable of handling consecutive requests without crashing.
+
+### 4.4. Frontend UI/UX Enhancements
+
+The Streamlit frontend was significantly updated to improve usability and expose the new evaluation capabilities:
+
+*    **Dual-Mode Interface**: A "Prediction Mode" / "Test Mode" toggle was added, allowing users to switch between generating future forecasts and running historical backtests. The UI dynamically updates descriptions and button labels to match the selected mode.
+
+*    **Enhanced Graph Visualization**: The forecast chart was improved to provide more context. It now features a vertical dotted line partitioning the historical data from the forecasted period. The "future" zone of the graph is conditionally colored light green or red based on whether the average forecast price is bullish or bearish compared to the last known price.
+
+### 4.5. Phase 4 (Next Plan): Statistical Preprocessing for Enhanced Forecasting
+
+While the process-isolation architecture has stabilized the application, the primary goal remains to improve the accuracy of the core time-series forecast. The failed "rolling summary" experiment revealed that feeding a qualitative, AI-generated summary to the forecasting model can introduce noise and ambiguity.
+
+Phase 4 will therefore pivot away from this approach and focus on replacing the natural language summary with a dense, token-efficient, and statistically significant representation of the historical context. The objective is to enhance the forecasting model's performance by providing it with a more structured and quantitatively rigorous prompt, without requiring a full model retrain.
+
+The planned methodology involves two key steps:
+
+*    **Statistical Feature Engineering**: Instead of a verbose paragraph, the pipeline will perform a series of statistical calculations on the historical context data to extract high-signal features. This will include metrics such as:
+
+       *   **Volatility Analysis**: Calculating rolling standard deviation to determine periods of high or low price stability.
+
+       *   **Trend & Momentum Indicators**: Implementing calculations for Moving Averages (e.g., 50-day vs. 200-day) and the Relative Strength Index (RSI) to quantify the strength and direction of the market trend.
+
+       *   **Support & Resistance**: Programmatically identifying key price levels where the stock has historically shown a tendency to reverse direction.
+
+*    **Token-Efficient Prompt Refactoring**: The extracted statistical features will be compiled into a compact, structured string format within the prompt (e.g., STATS: {VOLATILITY: HIGH, TREND: BULLISH, RSI: 68, MA50_X_MA200: TRUE}). The hypothesis is that this dense format will provide the LLM with clearer, more objective, and less ambiguous context than a natural language summary, leading to more accurate predictions while significantly optimizing token usage.
+
+Should this statistical refactoring approach in Phase 4 prove successful, a potential Phase 5 could be undertaken. This would involve a complete retraining of the TinyDeepSeek-0.5B-base forecasting model on a new dataset of millions of prompts built using this highly optimized, statistics-driven context structure. This could potentially unlock a new level of forecasting accuracy by teaching the model the deeper correlations between these specific quantitative indicators and future price movements.
